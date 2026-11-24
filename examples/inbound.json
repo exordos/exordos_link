@@ -1,0 +1,8 @@
+{
+  "role": "inbound",
+  "listen": "10.23.8.20:15432",
+  "targets": ["127.0.0.1:5432"],
+  "peer_ids": ["spiffe://example.test/api"],
+  "buffer_bytes": 16384,
+  "max_connections": 4096
+}
