@@ -44,6 +44,8 @@ same-host private route and the tested workloads.
 
 Download the `.deb` or `.tar.gz` for Linux amd64 or arm64 and the
 `SHA256SUMS` file from [GitHub Releases](https://github.com/exordos/exordos_link/releases).
+Release binaries are built on Ubuntu 24.04. The `.deb` declares its required
+versions of the C runtime libraries.
 
 ```sh
 sha256sum --ignore-missing --check SHA256SUMS
