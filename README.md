@@ -77,13 +77,41 @@ stay on the replica where they were established.
 
 ## Configuration and operations
 
+An installation can run multiple listeners in one Link process by using the
+managed configuration format. Set the optional connection limit on the process
+and list the listeners in `listeners`. Each listener uses the same fields as
+the single-listener examples, excluding `max_connections`.
+
+```json
+{
+  "max_connections": 4096,
+  "listeners": [
+    {
+      "role": "outbound",
+      "listen": "127.0.0.1:20000",
+      "targets": [{"address": "10.42.0.7:20000", "source": "10.42.0.4"}],
+      "peer_ids": ["spiffe://example.test/catalog"]
+    }
+  ]
+}
+```
+
+Both peers on a managed endpoint use the managed format. The TLS ALPN
+`exordos-endpoint/1` identifies the wire protocol. Once authenticated, the
+receiving proxy dials the application and sends a readiness byte inside
+TLS. If setup fails, the outbound proxy can try the next replica before
+forwarding application bytes. A scoped target binds the outgoing socket to
+the supplied source address. Guest routing needs to support that address.
+
 Publish a complete replacement JSON file with an atomic rename and send
 `SIGHUP`. Link logs `configuration applied` on success. An invalid update
 leaves the last applied configuration in use. An empty `peer_ids` list
 denies all peer IDs. An empty outbound `targets` list makes the route
 unavailable. These updates apply to new connections. Existing connections
-run until they close. Changes to `listen`, `role`, or `max_connections`
-require a restart.
+run until they close. A managed process adds and removes listeners on reload
+and retries unavailable bind addresses. Changes to the process connection
+limit or configuration format require a restart. The single-listener format
+also requires a restart when changing its listen address or role.
 
 The inbound access log records verified peer IDs and reports duration and
 byte counts when a session ends. A bounded queue and a dedicated writer
@@ -91,7 +119,8 @@ batch output to stderr. A full queue makes affected sessions wait
 asynchronously and may drop listener diagnostics. `SIGTERM` and `SIGINT`
 stop the proxy and drain queued records. Set the process file descriptor
 limit to at least `2 × max_connections + 64` to make the full configured
-capacity available.
+capacity available with a single-listener configuration. Budget one
+additional descriptor per managed listener.
 
 ## Build and test
 

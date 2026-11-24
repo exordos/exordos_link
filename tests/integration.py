@@ -162,7 +162,9 @@ def start_proxy(stack, directory, binary, name, workload_socket, config):
     write_config(path, config)
     process = spawn(stack, log, binary, path,
                     env={**os.environ, "SPIFFE_ENDPOINT_SOCKET": f"unix://{workload_socket}"})
-    wait_for(f"{name} listener", lambda: "ready " in log.read_text(), process)
+    addresses = [c["listen"] for c in config.get("listeners", (config,))]
+    wait_for(f"{name} listeners", lambda: all(f" {addr}\n" in log.read_text()
+                                             for addr in addresses), process)
     return process, path, log
 
 
@@ -216,8 +218,79 @@ def check_reload_with_full_stderr(directory, binary, sock, listen, outbound, con
     print("PASS: reload and forwarding with a full stderr pipe")
 
 
+def check_managed_listeners(stack, directory, binary, sockets):
+    replicas = []
+    for index, name in enumerate(("first", "second")):
+        listeners = []
+        for port in range(2):
+            app = stack.enter_context(ExitStack())
+            target = echo_server(app, f"{index}:{port}\n".encode())
+            listeners.append((app, {
+                "role": "inbound",
+                "listen": endpoint(address()),
+                "targets": [endpoint(target)],
+                "peer_ids": [CLIENT],
+                "connect_timeout_ms": 1000,
+            }))
+        config = {"listeners": [item for _, item in listeners]}
+        process = start_proxy(stack, directory, binary, f"managed-{name}", sockets[name], config)
+        replicas.append((process, listeners, config))
+
+    addresses = [address(), address()]
+    routes = [
+        {
+            "role": "outbound",
+            "listen": endpoint(public),
+            "targets": [
+                {"address": listeners[port][1]["listen"], "source": "127.0.0.1"}
+                for _, listeners, _ in replicas
+            ],
+            "peer_ids": [BACKEND],
+            "connect_timeout_ms": 1000,
+        }
+        for port, public in enumerate(addresses)
+    ]
+    client = start_proxy(
+        stack, directory, binary, "managed-client", sockets["client"], {"listeners": routes}
+    )
+    for port, public in enumerate(addresses):
+        assert {request(public) for _ in range(4)} == {
+            f"0:{port}\n".encode(), f"1:{port}\n".encode()
+        }
+
+    replicas[0][1][0][0].close()
+    assert {request(addresses[0]) for _ in range(4)} == {b"1:0\n"}
+    assert {request(addresses[1]) for _ in range(4)} == {b"0:1\n", b"1:1\n"}
+    assert all(proxy[0].poll() is None for proxy, _, _ in replicas)
+
+    for proxy, listeners, _ in replicas:
+        reload_proxy(proxy, {"listeners": [listeners[1][1]]})
+    assert request(addresses[0]) == b""
+    assert {request(addresses[1]) for _ in range(4)} == {b"0:1\n", b"1:1\n"}
+    reload_proxy(client, {"listeners": [routes[1]]})
+    reload_proxy(client, {"listeners": routes})
+    assert request(addresses[0]) == b""
+
+    process, path, log = client
+    with socket.socket() as blocked:
+        blocked.bind(("127.0.0.1", 0))
+        blocked.listen()
+        pending = {**routes[1], "listen": endpoint(blocked.getsockname())}
+        applied = log.read_text().count("configuration applied")
+        write_config(path, {"listeners": [*routes, pending]})
+        process.send_signal(signal.SIGHUP)
+        wait_for("partial reload", lambda: "retrying unavailable listeners" in log.read_text(), process)
+        assert log.read_text().count("configuration applied") == applied
+        assert request(addresses[1]) in (b"0:1\n", b"1:1\n")
+        later_address = blocked.getsockname()
+    wait_for("automatic bind retry", lambda: log.read_text().count("configuration applied") > applied, process)
+    assert request(later_address) in (b"0:1\n", b"1:1\n")
+    print("PASS: managed listeners, per-endpoint failover, and revocation")
+
+
 def run(stack, directory, binary, spire_bin):
     sockets = start_spire(stack, directory, spire_bin)
+    check_managed_listeners(stack, directory, binary, sockets)
     inbound = []
     for name, reply in (("first", b"one\n"), ("second", b"two\n")):
         config = {
