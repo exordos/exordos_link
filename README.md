@@ -1,7 +1,7 @@
 # Exordos Link
 
-Exordos Link is a Linux TCP proxy for private service-to-service links. It
-uses TLS 1.3 and X.509-SVIDs from the SPIFFE Workload API to authenticate both
+Exordos Link is a Linux proxy for private service-to-service endpoints. It
+uses TLS 1.3 and X.509-SVIDs from a PEM file to authenticate both
 ends. Each listener has an exact allowlist of peer SPIFFE IDs. An outbound
 proxy selects a reachable replica and retries another replica when TCP connect
 or the client-side TLS handshake fails. Once the client handshake returns, the
@@ -11,8 +11,8 @@ closes the connection.
 ## Why Link for this data path
 
 Link has a single Tokio I/O worker, a fixed copy buffer per direction, and
-a TCP-only forwarding path. It reads static JSON and obtains rotated
-credentials from the Workload API. This fits direct private links where
+a direct TCP forwarding path. It reads JSON policy and reloads the PEM
+credentials on SIGHUP. This fits direct private links where
 another component already owns service discovery and policy distribution.
 
 In our direct-veth comparison, both products ran as an outbound/inbound pair
@@ -49,49 +49,80 @@ versions of the C runtime libraries.
 
 ```sh
 sha256sum --ignore-missing --check SHA256SUMS
-sudo apt install ./exordos-link_0.0.1_amd64.deb
+sudo apt install ./exordos-link_*_"$(dpkg --print-architecture)".deb
 exordos-link --version
 ```
 
-On each machine, register the proxy with a local SPIRE Agent. For example,
-issue `spiffe://example.test/api` to the outbound proxy and issue
-`spiffe://example.test/db` to the inbound proxy on each database replica.
-Restrict access to the local outbound listener to processes that may act
-with that proxy's identity. TCP loopback is shared by processes in the same
-network namespace.
-
-On each destination, run Link with [the inbound config](examples/inbound.json).
-It listens on a private interface and sends traffic to one local application
-listener. On the client, use [the outbound config](examples/outbound.json).
-It listens on loopback and selects one of the private replica addresses.
-Replace the example addresses and SPIFFE IDs with values from your deployment.
+Provision one PEM file containing the workload certificate, public CA bundle and
+private key, with the workload certificate first. Link reads
+`/var/lib/exordos/link/identity.pem` by default. Use
+`EXORDOS_LINK_CREDENTIALS` to specify a different path. Replace the complete
+file atomically and send `SIGHUP` to refresh credentials on live listeners.
 
 ```sh
-SPIFFE_ENDPOINT_SOCKET=unix:///run/spire/agent.sock exordos-link examples/outbound.json
+EXORDOS_LINK_CREDENTIALS=/path/to/identity.pem exordos-link examples/outbound.json
 ```
 
-The periodic TCP probe measures reachability of the remote proxy. A deployment
-that publishes only ready application replicas must supply its own endpoint
-membership, for example the current writable database leader. Open streams
-stay on the replica where they were established.
+Restrict access to outbound loopback listeners to trusted local processes.
+The receiving peer sees the Link workload identity for every local caller.
+
+Outbound listeners probe TCP reachability of each remote Link at startup and
+wait 60 seconds between probe rounds by default. Set `health_interval_ms` on
+the outbound listener to change the interval. Link tries reachable replicas
+first and falls back to replicas that failed a probe if needed. A deployment
+that publishes only ready application replicas must supply its own membership, for
+example the current writable database leader. Open streams stay on the replica
+where they were established.
 
 ## Configuration and operations
+
+Link can run multiple listeners in one process. Set the optional connection
+limit on the process and list the listeners in `listeners`.
+
+```json
+{
+  "max_connections": 4096,
+  "listeners": [
+    {
+      "role": "outbound",
+      "listen": "127.0.0.1:20000",
+      "targets": [{"address": "10.42.0.7:20000", "source": "10.42.0.4"}],
+      "peer_ids": ["spiffe://example.test/catalog"]
+    }
+  ]
+}
+```
+
+The TLS ALPN `exordos-endpoint/1` identifies the wire protocol. Once authenticated, the
+receiving proxy dials the application and sends a readiness byte inside
+TLS. If setup fails, the outbound proxy can try the next replica before
+forwarding application bytes. A scoped target binds the outgoing socket to
+the supplied source address. Guest routing needs to support that address.
+
+Set `protocol` on each inbound listener. `tcp` relays bytes. `http` handles
+HTTP/1.x and HTTP/2 with a cleartext HTTP/2 preface, including gRPC. The
+receiving proxy replaces `X-Forwarded-Client-Cert` on each request with the
+authenticated caller's URI SAN and certificate fingerprint. Bind the
+application to a dedicated loopback port and restrict local access to the
+trusted proxy. WebSocket upgrades carry the header on the opening request.
 
 Publish a complete replacement JSON file with an atomic rename and send
 `SIGHUP`. Link logs `configuration applied` on success. An invalid update
 leaves the last applied configuration in use. An empty `peer_ids` list
 denies all peer IDs. An empty outbound `targets` list makes the route
 unavailable. These updates apply to new connections. Existing connections
-run until they close. Changes to `listen`, `role`, or `max_connections`
-require a restart.
+run until they close. Switching an application port to HTTP closes earlier
+TCP sessions to that address. Link adds and removes listeners on reload
+and retries unavailable bind addresses. Changes to the process connection
+limit require a restart.
 
 The inbound access log records verified peer IDs and reports duration and
 byte counts when a session ends. A bounded queue and a dedicated writer
 batch output to stderr. A full queue makes affected sessions wait
 asynchronously and may drop listener diagnostics. `SIGTERM` and `SIGINT`
 stop the proxy and drain queued records. Set the process file descriptor
-limit to at least `2 × max_connections + 64` to make the full configured
-capacity available.
+limit to at least `2 × max_connections + 64` plus one descriptor per listener
+to make the full configured capacity available.
 
 ## Build and test
 
@@ -99,13 +130,14 @@ Build on Linux with the pinned Rust toolchain, a C compiler, CMake, and Make.
 
 ```sh
 cargo build --locked --release
-python3 tests/integration.py target/release/exordos-link /path/to/spire/bin
+python3 tests/integration.py target/release/exordos-link
+python3 tests/integration_grpc.py target/release/exordos-link
 bash packaging/build.sh target/release/exordos-link dist
 ```
 
-The integration test starts an isolated SPIRE Server and three agents on
-loopback. It exercises authentication, replica failover, live revocation,
-and access logging. Packaging uses `dpkg-deb` and `dpkg-shlibdeps` from the
+The integration test issues certificates with a disposable CA and exercises authentication, replica failover, live revocation,
+access logging, and HTTP header forwarding. The gRPC test requires `grpcio`.
+Packaging uses `dpkg-deb` and `dpkg-shlibdeps` from the
 Debian tools. GitHub Actions run the checks and package builds on both Linux
 architectures and publish artifacts when the tag matches the binary version.
 

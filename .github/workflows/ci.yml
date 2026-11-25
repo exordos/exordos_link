@@ -29,10 +29,8 @@ jobs:
         include:
           - arch: amd64
             runner: ubuntu-24.04
-            spire_sha256: 7bcf5e167151a1fc58293768462b44e155ba8784214582aefa6adf18c633d1d5
           - arch: arm64
             runner: ubuntu-24.04-arm
-            spire_sha256: ba2804905a27ca72b0478ae790b580ea26233abafac7e480bbaf54152d5c2c5b
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -44,19 +42,13 @@ jobs:
           cargo clippy --locked --release --all-targets -- -D warnings
       - name: Build release binary
         run: cargo build --locked --release
-      - name: Test with SPIRE
-        env:
-          ARCH: ${{ matrix.arch }}
-          SPIRE_SHA256: ${{ matrix.spire_sha256 }}
+      - name: Test mTLS
         run: |
-          version=1.16.0
-          archive="spire-$version-linux-$ARCH-musl.tar.gz"
-          curl --fail --silent --show-error --location --retry 3 \
-            "https://github.com/spiffe/spire/releases/download/v$version/$archive" \
-            --output "$RUNNER_TEMP/$archive"
-          printf '%s  %s\n' "$SPIRE_SHA256" "$RUNNER_TEMP/$archive" | sha256sum --check
-          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
-          python3 tests/integration.py target/release/exordos-link "$RUNNER_TEMP/spire-$version/bin"
+          python3 tests/integration.py target/release/exordos-link
+          python3 -m venv "$RUNNER_TEMP/grpc-test"
+          # grpcio is an Apache-2.0 test-only dependency.
+          "$RUNNER_TEMP/grpc-test/bin/python" -m pip install --only-binary=:all: grpcio==1.82.1
+          "$RUNNER_TEMP/grpc-test/bin/python" tests/integration_grpc.py target/release/exordos-link
       - name: Package and check archives
         env:
           ARCH: ${{ matrix.arch }}
