@@ -18,7 +18,7 @@ import socketserver
 import subprocess
 import sys
 import tempfile
-from threading import Thread
+from threading import Event, Thread
 import time
 
 
@@ -293,6 +293,8 @@ def check_managed_listeners(stack, directory, binary, sockets):
 
 
 def check_http(stack, directory, binary, sockets):
+    close_idle = Event()
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -321,6 +323,9 @@ def check_http(stack, directory, binary, sockets):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            if self.path == "/close-idle":
+                assert close_idle.wait(3)
+                self.close_connection = True
 
         def log_message(self, *args):
             pass
@@ -407,10 +412,18 @@ def check_http(stack, directory, binary, sockets):
                          b"Upgrade: websocket\r\n\r\n")
         with upgraded.makefile("rb") as stream:
             assert stream.readline().split()[1] == b"101"
-            for header in iter(stream.readline, b"\r\n"):
-                assert header
+            headers = http.client.parse_headers(stream)
+            assert headers.get_all("Connection") == ["upgrade"]
             upgraded.sendall(b"ping")
             assert stream.read(4) == b"ping"
+    connection.request("GET", "/close-idle")
+    response = connection.getresponse()
+    assert response.status == 200
+    response.read()
+    close_idle.set()
+    assert connection.sock.recv(1) == b"", "Downstream kept the closed backend alive"
+    connection.close()
+    assert available(), "Fresh HTTP connection failed after backend closed"
     print("PASS: HTTP/1.1 XFCC, keepalive, upgrades and TCP-to-HTTP cutover")
 
 

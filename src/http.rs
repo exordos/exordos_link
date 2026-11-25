@@ -174,8 +174,10 @@ impl Backend {
                 Sender::Http2(sender)
             } else {
                 let (sender, connection) = http1::handshake(io).await?;
+                let closed = self.closed.clone();
                 self.tasks.spawn(async move {
                     let _ = connection.with_upgrades().await;
+                    closed.notify_one();
                 });
                 Sender::Http1(sender)
             });
@@ -291,6 +293,8 @@ pub async fn forward(
     );
     tokio::pin!(downstream);
     tokio::select! {
+        // An upstream upgrade may already have queued the downstream 101.
+        biased;
         result = &mut downstream => result?,
         _ = backend_closed.notified() => {
             downstream.as_mut().graceful_shutdown();
