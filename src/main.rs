@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 mod access_log;
+mod http;
 
 use access_log::{AccessLog, Event, Session};
 use arc_swap::ArcSwap;
@@ -13,8 +14,8 @@ use std::ffi::OsStr;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional_with_sizes};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
@@ -24,6 +25,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tokio_rustls::rustls::{self, ClientConfig, ServerConfig, pki_types::ServerName};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_util::sync::CancellationToken;
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 const USAGE: &str = "Usage: exordos-link CONFIG.json\n       exordos-link --version";
@@ -37,6 +39,13 @@ enum Role {
     Outbound,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum Protocol {
+    Tcp,
+    Http,
+}
+
 #[derive(Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -44,13 +53,13 @@ struct Config {
     listen: SocketAddr,
     targets: Vec<Target>,
     peer_ids: Vec<String>,
+    protocol: Option<Protocol>,
     #[serde(default = "buffer_default")]
     buffer_bytes: usize,
     #[serde(default = "connect_default")]
     connect_timeout_ms: u64,
     #[serde(default = "health_default")]
     health_interval_ms: u64,
-    max_connections: Option<usize>,
 }
 
 #[derive(Clone, Copy, Deserialize, PartialEq)]
@@ -78,17 +87,10 @@ impl Target {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ManagedConfig {
+struct FileConfig {
     listeners: Vec<Config>,
     #[serde(default = "connections_default")]
     max_connections: usize,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum FileConfig {
-    Legacy(Config),
-    Managed(ManagedConfig),
 }
 
 fn buffer_default() -> usize {
@@ -105,9 +107,9 @@ fn connections_default() -> usize {
 }
 
 impl Config {
-    fn validate(&self, managed: bool) -> Result<()> {
+    fn validate(&self) -> Result<()> {
         if self.listen.port() == 0
-            || (managed && self.listen.ip().is_unspecified())
+            || self.listen.ip().is_unspecified()
             || self.targets.iter().any(|target| {
                 let address = target.address();
                 address.port() == 0
@@ -120,7 +122,7 @@ impl Config {
             || !(1024..=262144).contains(&self.buffer_bytes)
             || !(1..=60000).contains(&self.connect_timeout_ms)
             || !(10..=60000).contains(&self.health_interval_ms)
-            || (managed && self.max_connections.is_some())
+            || self.protocol.is_some() != (self.role == Role::Inbound)
             || (self.role == Role::Outbound && !self.listen.ip().is_loopback())
             || (self.role == Role::Inbound
                 && (self.targets.len() != 1 || !self.targets[0].address().ip().is_loopback()))
@@ -135,41 +137,23 @@ impl FileConfig {
     fn load(path: &Path) -> Result<Self> {
         let config: Self = serde_json::from_slice(&std::fs::read(path)?)?;
         let mut addresses = std::collections::HashSet::new();
-        for listener in config.listeners() {
-            listener.validate(config.managed())?;
+        let mut protocols = HashMap::new();
+        for listener in &config.listeners {
+            listener.validate()?;
             if !addresses.insert(listener.listen) {
                 return Err("duplicate listen address".into());
             }
+            if let Some(protocol) = listener.protocol
+                && let Some(previous) = protocols.insert(listener.targets[0].address(), protocol)
+                && previous != protocol
+            {
+                return Err("application address cannot mix HTTP and TCP listeners".into());
+            }
         }
-        if !(1..=65536).contains(&config.max_connections()) {
+        if !(1..=65536).contains(&config.max_connections) {
             return Err("invalid connection limit".into());
         }
         Ok(config)
-    }
-
-    fn managed(&self) -> bool {
-        matches!(self, Self::Managed(_))
-    }
-
-    fn listeners(&self) -> &[Config] {
-        match self {
-            Self::Legacy(config) => std::slice::from_ref(config),
-            Self::Managed(config) => &config.listeners,
-        }
-    }
-
-    fn max_connections(&self) -> usize {
-        match self {
-            Self::Legacy(config) => config.max_connections.unwrap_or_else(connections_default),
-            Self::Managed(config) => config.max_connections,
-        }
-    }
-
-    fn into_listeners(self) -> Vec<Config> {
-        match self {
-            Self::Legacy(config) => vec![config],
-            Self::Managed(config) => config.listeners,
-        }
     }
 }
 
@@ -188,31 +172,30 @@ struct State {
     tls: Tls,
     backends: Vec<Backend>,
     next: AtomicUsize,
-    managed: bool,
     valid: AtomicBool,
+    http_source: Option<X509Source>,
+    tcp_sessions: Option<Arc<CancellationToken>>,
 }
+
+type TcpSessions = HashMap<SocketAddr, Weak<CancellationToken>>;
 
 fn make_state(
     config: Config,
-    managed: bool,
     source: X509Source,
-    access_log: Option<&AccessLog>,
+    access_log: &AccessLog,
+    tcp_sessions: &mut TcpSessions,
 ) -> Result<State> {
+    let http_source = (config.protocol == Some(Protocol::Http)).then(|| source.clone());
     let authorizer = authorizer::exact(config.peer_ids.iter().map(String::as_str))?;
     let tls = match config.role {
         Role::Inbound => {
             let mut server = mtls_server(source).authorize(authorizer).build()?;
-            if managed {
-                server.alpn_protocols = vec![ENDPOINT_PROTOCOL.to_vec()];
-            }
-            let log = access_log.ok_or("missing inbound access log")?;
-            Tls::Server(Arc::new(server), log.clone())
+            server.alpn_protocols = vec![ENDPOINT_PROTOCOL.to_vec()];
+            Tls::Server(Arc::new(server), access_log.clone())
         }
         Role::Outbound => {
             let mut client = mtls_client(source).authorize(authorizer).build()?;
-            if managed {
-                client.alpn_protocols = vec![ENDPOINT_PROTOCOL.to_vec()];
-            }
+            client.alpn_protocols = vec![ENDPOINT_PROTOCOL.to_vec()];
             Tls::Client(Arc::new(client))
         }
     };
@@ -224,13 +207,23 @@ fn make_state(
             healthy: AtomicBool::new(true),
         })
         .collect();
+    let tcp_sessions = (config.protocol == Some(Protocol::Tcp)).then(|| {
+        let target = config.targets[0].address();
+        if let Some(token) = tcp_sessions.get(&target).and_then(Weak::upgrade) {
+            return token;
+        }
+        let token = Arc::new(CancellationToken::new());
+        tcp_sessions.insert(target, Arc::downgrade(&token));
+        token
+    });
     Ok(State {
         config,
         tls,
         backends,
         next: AtomicUsize::new(0),
-        managed,
         valid: AtomicBool::new(true),
+        http_source,
+        tcp_sessions,
     })
 }
 
@@ -266,7 +259,7 @@ async fn serve(mut incoming: TcpStream, state: Arc<State>) -> Result<()> {
                 .peer_certificates()
                 .and_then(|chain| chain.first())
                 .ok_or("authenticated connection missing peer certificate")?;
-            if state.managed && encrypted.get_ref().1.alpn_protocol() != Some(ENDPOINT_PROTOCOL) {
+            if encrypted.get_ref().1.alpn_protocol() != Some(ENDPOINT_PROTOCOL) {
                 return Err("endpoint protocol negotiation failed".into());
             }
             if !state.valid.load(Ordering::Acquire) {
@@ -278,25 +271,44 @@ async fn serve(mut incoming: TcpStream, state: Arc<State>) -> Result<()> {
                 listen: state.config.listen,
                 upstream: target.address(),
             });
+            let xfcc = state
+                .http_source
+                .as_ref()
+                .map(|source| {
+                    let proxy = source.svid()?;
+                    http::peer_header(proxy.spiffe_id(), &session.caller, peer_cert.as_ref())
+                })
+                .transpose()?;
             let (status, relayed) = match timeout(limit, dial(target)).await {
                 Ok(Ok(mut local)) => {
                     if !state.valid.load(Ordering::Acquire) {
                         return Err("listener configuration changed before forwarding".into());
                     }
-                    if state.managed {
-                        timeout(limit, async {
-                            encrypted.write_u8(UPSTREAM_READY).await?;
-                            encrypted.flush().await
-                        })
-                        .await??;
-                    }
+                    timeout(limit, async {
+                        encrypted.write_u8(UPSTREAM_READY).await?;
+                        encrypted.flush().await
+                    })
+                    .await??;
                     access_log.record(session.clone(), Event::Open).await;
-                    let relayed =
-                        copy_bidirectional_with_sizes(&mut encrypted, &mut local, size, size).await;
+                    let relayed = if let Some(header) = xfcc {
+                        http::forward(encrypted, local, header, size).await
+                    } else {
+                        let copy =
+                            copy_bidirectional_with_sizes(&mut encrypted, &mut local, size, size);
+                        if let Some(sessions) = &state.tcp_sessions {
+                            tokio::select! {
+                                biased;
+                                _ = sessions.cancelled() => Ok(None),
+                                result = copy => result.map(Some).map_err(Into::into),
+                            }
+                        } else {
+                            copy.await.map(Some).map_err(Into::into)
+                        }
+                    };
                     let status = if relayed.is_ok() { "ok" } else { "relay_error" };
                     (status, relayed)
                 }
-                Ok(Err(error)) => ("upstream_error", Err(error)),
+                Ok(Err(error)) => ("upstream_error", Err(error.into())),
                 Err(error) => ("upstream_error", Err(error.into())),
             };
             access_log
@@ -304,7 +316,7 @@ async fn serve(mut incoming: TcpStream, state: Arc<State>) -> Result<()> {
                     session,
                     Event::End {
                         status,
-                        bytes: relayed.as_ref().ok().copied(),
+                        bytes: relayed.as_ref().ok().copied().flatten(),
                         duration_ms: started.elapsed().as_millis(),
                     },
                 )
@@ -324,9 +336,8 @@ async fn serve(mut incoming: TcpStream, state: Arc<State>) -> Result<()> {
                 let connect = async {
                     let socket = dial(backend.target).await?;
                     let mut stream = connector.connect(server_name.clone(), socket).await?;
-                    if state.managed
-                        && (stream.get_ref().1.alpn_protocol() != Some(ENDPOINT_PROTOCOL)
-                            || stream.read_u8().await? != UPSTREAM_READY)
+                    if stream.get_ref().1.alpn_protocol() != Some(ENDPOINT_PROTOCOL)
+                        || stream.read_u8().await? != UPSTREAM_READY
                     {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -366,16 +377,10 @@ async fn health(state: Arc<ArcSwap<State>>, probes: Arc<Semaphore>) {
                 let target = backend.target;
                 let probes = probes.clone();
                 tasks.spawn(async move {
-                    let _descriptor = if current.managed {
-                        Some(
-                            probes
-                                .acquire_owned()
-                                .await
-                                .expect("probe semaphore is open"),
-                        )
-                    } else {
-                        None
-                    };
+                    let _descriptor = probes
+                        .acquire_owned()
+                        .await
+                        .expect("probe semaphore is open");
                     let healthy = matches!(timeout(limit, dial(target)).await, Ok(Ok(_)));
                     current.backends[index]
                         .healthy
@@ -410,26 +415,11 @@ fn main() -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let (access_log, writer) = if config.managed() || config.listeners()[0].role == Role::Inbound {
-        let (access_log, writer) = AccessLog::start()?;
-        (Some(access_log), Some(writer))
-    } else {
-        (None, None)
-    };
+    let (access_log, writer) = AccessLog::start()?;
     let result = runtime.block_on(run(path, config, access_log));
     drop(runtime);
-    if let Some(writer) = writer {
-        writer.join().map_err(|_| "access log writer panicked")?;
-    }
+    writer.join().map_err(|_| "access log writer panicked")?;
     result
-}
-
-fn runtime_diagnostic(access_log: Option<&AccessLog>, line: String) {
-    if let Some(access_log) = access_log {
-        access_log.diagnostic(line);
-    } else {
-        eprintln!("{line}");
-    }
 }
 
 struct RunningListener {
@@ -449,13 +439,13 @@ async fn accept(
     state: Arc<ArcSwap<State>>,
     capacity: Arc<Semaphore>,
     sockets: Arc<Semaphore>,
-    access_log: Option<AccessLog>,
+    access_log: AccessLog,
 ) {
     loop {
         let (socket, _) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(error) => {
-                runtime_diagnostic(access_log.as_ref(), format!("accept blocked: {error}"));
+                access_log.diagnostic(format!("accept blocked: {error}"));
                 sleep(Duration::from_millis(50)).await;
                 continue;
             }
@@ -478,15 +468,15 @@ async fn accept(
 fn listener_states(
     config: FileConfig,
     source: &X509Source,
-    access_log: Option<&AccessLog>,
+    access_log: &AccessLog,
+    tcp_sessions: &mut TcpSessions,
 ) -> Result<HashMap<SocketAddr, Arc<State>>> {
-    let managed = config.managed();
     config
-        .into_listeners()
+        .listeners
         .into_iter()
         .map(|config| {
             let address = config.listen;
-            let state = make_state(config, managed, source.clone(), access_log)?;
+            let state = make_state(config, source.clone(), access_log, tcp_sessions)?;
             Ok((address, Arc::new(state)))
         })
         .collect()
@@ -498,9 +488,8 @@ async fn open_listeners(
     limit: &Arc<Semaphore>,
     sockets: &Arc<Semaphore>,
     probes: &Arc<Semaphore>,
-    access_log: Option<&AccessLog>,
-    managed: bool,
-) -> Result<()> {
+    access_log: &AccessLog,
+) {
     running.retain(|address, _| wanted.contains_key(address));
     for (address, listener) in running.iter() {
         let desired = &wanted[address];
@@ -514,24 +503,17 @@ async fn open_listeners(
             continue;
         }
         let Ok(mut descriptors) = sockets.clone().try_acquire_many_owned(3) else {
-            runtime_diagnostic(
-                access_log,
-                "listener waiting for available descriptors".into(),
-            );
+            access_log.diagnostic("listener waiting for available descriptors".into());
             break;
         };
         let descriptor = descriptors.split(1).expect("three descriptors reserved");
         drop(descriptors);
         let socket = match TcpListener::bind(address).await {
             Ok(socket) => socket,
-            Err(error) if managed => {
-                runtime_diagnostic(
-                    access_log,
-                    format!("unable to listen on {address}: {error}"),
-                );
+            Err(error) => {
+                access_log.diagnostic(format!("unable to listen on {address}: {error}"));
                 continue;
             }
-            Err(error) => return Err(error.into()),
         };
         let state = Arc::new(ArcSwap::from(desired.clone()));
         let accept_state = state.clone();
@@ -539,7 +521,7 @@ async fn open_listeners(
         let limit = limit.clone();
         let sockets = sockets.clone();
         let probes = probes.clone();
-        let log = access_log.cloned();
+        let log = access_log.clone();
         let task = tokio::spawn(async move {
             let _descriptor = descriptor;
             tokio::select! {
@@ -547,22 +529,13 @@ async fn open_listeners(
                 _ = health(health_state, probes) => {}
             }
         });
-        runtime_diagnostic(
-            access_log,
-            format!("ready {:?} {address}", desired.config.role),
-        );
+        access_log.diagnostic(format!("ready {:?} {address}", desired.config.role));
         running.insert(address, RunningListener { state, task });
     }
-    Ok(())
 }
 
-async fn run(path: PathBuf, config: FileConfig, access_log: Option<AccessLog>) -> Result<()> {
-    let managed = config.managed();
-    let capacity = config.max_connections();
-    let legacy_listener = (!managed).then(|| {
-        let config = &config.listeners()[0];
-        (config.listen, config.role)
-    });
+async fn run(path: PathBuf, config: FileConfig, access_log: AccessLog) -> Result<()> {
+    let capacity = config.max_connections;
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();
     provider.cipher_suites =
         vec![rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256];
@@ -571,11 +544,11 @@ async fn run(path: PathBuf, config: FileConfig, access_log: Option<AccessLog>) -
         .install_default()
         .map_err(|_| "failed to set TLS crypto provider")?;
     let source = X509Source::new().await?;
-    let mut wanted = listener_states(config, &source, access_log.as_ref())?;
-    // The FD reserve covers Workload API and bounded managed health probes.
-    // Legacy configuration also counts its sole listener in that reserve.
+    let mut tcp_sessions = TcpSessions::new();
+    let mut wanted = listener_states(config, &source, &access_log, &mut tcp_sessions)?;
+    // The FD reserve covers Workload API and bounded health probes.
     let descriptor_limit = getrlimit(Resource::Nofile).current.unwrap_or(u64::MAX);
-    let descriptor_budget = descriptor_limit.saturating_sub(if managed { 64 } else { 63 });
+    let descriptor_budget = descriptor_limit.saturating_sub(64);
     if descriptor_budget < 3 {
         return Err("RLIMIT_NOFILE leaves no capacity for proxied connections".into());
     }
@@ -594,47 +567,50 @@ async fn run(path: PathBuf, config: FileConfig, access_log: Option<AccessLog>) -
         &capacity_limit,
         &sockets,
         &probes,
-        access_log.as_ref(),
-        managed,
+        &access_log,
     )
-    .await?;
+    .await;
     let mut retry = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
             _ = retry.tick(), if running.len() != wanted.len() => {
                 open_listeners(
-                    &mut running, &wanted, &capacity_limit, &sockets, &probes, access_log.as_ref(), managed,
-                ).await?;
+                    &mut running, &wanted, &capacity_limit, &sockets, &probes, &access_log,
+                ).await;
                 if running.len() == wanted.len() {
-                    runtime_diagnostic(access_log.as_ref(), "configuration applied".into());
+                    access_log.diagnostic("configuration applied".into());
                 }
             }
             _ = reload.recv() => {
                 let new = FileConfig::load(&path).and_then(|config| {
-                    if config.managed() != managed || config.max_connections() != capacity
-                        || legacy_listener.is_some_and(|current| {
-                            let next = &config.listeners()[0];
-                            current != (next.listen, next.role)
-                        })
-                    {
-                        return Err("changing mode, legacy listener or capacity requires restart".into());
+                    if config.max_connections != capacity {
+                        return Err("changing capacity requires restart".into());
                     }
-                    listener_states(config, &source, access_log.as_ref())
+                    listener_states(config, &source, &access_log, &mut tcp_sessions)
                 });
                 match new {
                     Ok(new) => {
+                        for state in new.values().filter(|s| s.config.protocol == Some(Protocol::Http)) {
+                            if let Some(token) = tcp_sessions
+                                .remove(&state.config.targets[0].address())
+                                .and_then(|token| token.upgrade())
+                            {
+                                token.cancel();
+                            }
+                        }
+                        tcp_sessions.retain(|_, token| token.strong_count() > 0);
                         wanted = new;
                         open_listeners(
-                            &mut running, &wanted, &capacity_limit, &sockets, &probes, access_log.as_ref(), managed,
-                        ).await?;
+                            &mut running, &wanted, &capacity_limit, &sockets, &probes, &access_log,
+                        ).await;
                         let status = if running.len() == wanted.len() {
                             "configuration applied"
                         } else {
                             "configuration loaded; retrying unavailable listeners"
                         };
-                        runtime_diagnostic(access_log.as_ref(), status.into());
+                        access_log.diagnostic(status.into());
                     }
-                    Err(error) => runtime_diagnostic(access_log.as_ref(), format!("configuration rejected: {error}")),
+                    Err(error) => access_log.diagnostic(format!("configuration rejected: {error}")),
                 }
             }
             _ = terminate.recv() => return Ok(()),

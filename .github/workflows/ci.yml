@@ -57,6 +57,10 @@ jobs:
           printf '%s  %s\n' "$SPIRE_SHA256" "$RUNNER_TEMP/$archive" | sha256sum --check
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
           python3 tests/integration.py target/release/exordos-link "$RUNNER_TEMP/spire-$version/bin"
+          python3 -m venv "$RUNNER_TEMP/grpc-test"
+          # grpcio is an Apache-2.0 test-only dependency.
+          "$RUNNER_TEMP/grpc-test/bin/python" -m pip install --only-binary=:all: grpcio==1.82.1
+          "$RUNNER_TEMP/grpc-test/bin/python" tests/integration_grpc.py target/release/exordos-link "$RUNNER_TEMP/spire-$version/bin"
       - name: Package and check archives
         env:
           ARCH: ${{ matrix.arch }}

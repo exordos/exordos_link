@@ -1,23 +1,28 @@
 [package]
 name = "exordos-link"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 rust-version = "1.93.1"
 license = "Apache-2.0"
-description = "SPIFFE-authenticated TCP proxy for private service-to-service links"
+description = "SPIFFE-authenticated proxy for private service-to-service endpoints"
 repository = "https://github.com/exordos/exordos_link"
 publish = false
 
 [dependencies]
 arc-swap = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rustix = { version = "1", features = ["process"] }
+sha2 = "0.10"
 spiffe = { version = "0", default-features = false, features = ["x509-source"] }
 spiffe-rustls = { version = "0", default-features = false, features = ["aws-lc-rs"] }
 time = { version = "0.3", features = ["formatting", "macros"] }
 tokio = { version = "1", features = ["rt", "net", "io-util", "signal", "sync", "time", "macros"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 
 [profile.release]
 lto = "thin"
